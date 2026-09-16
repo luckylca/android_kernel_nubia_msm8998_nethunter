@@ -1,0 +1,50 @@
+# NetHunter kernel config fragment for NX563J (Nubia Z17), LineageOS 22.2.
+# Merged on top of lineageos_nx563j_defconfig by .github/workflows/build.yml.
+# Union of the Ubuntu-phase capability fragments (nubiaz17_linux project):
+#   usb-diag      gadget serial/ecm/acm (configfs)
+#   bt            WCN3990 HCIUART + RFCOMM/BNEP/HIDP
+#   nethunter-wifi  external USB Wi-Fi: MAC80211 + ath9k_htc + rtl8xxxu
+#   nethunter-misc  USB BT dongle (btusb), SocketCAN gs_usb, NFS client
+# Rules: keep CONFIG_* tokens out of comment text; no USB_G_SERIAL/USB_G_NCM
+# (configfs choice conflict); no RNDIS (multi-composite link error on 4.4).
+
+# --- usb-diag ----------------------------------------------------
+CONFIG_DEVTMPFS=y
+CONFIG_DEVTMPFS_MOUNT=y
+CONFIG_USB_U_SERIAL=y
+CONFIG_USB_U_ETHER=y
+CONFIG_USB_F_SERIAL=y
+CONFIG_USB_F_ACM=y
+CONFIG_USB_F_ECM=y
+CONFIG_USB_CONFIGFS=y
+CONFIG_USB_CONFIGFS_SERIAL=y
+CONFIG_USB_CONFIGFS_ACM=y
+CONFIG_USB_CONFIGFS_ECM=y
+
+# --- bt ----------------------------------------------------------
+CONFIG_BT_HCIUART=y
+CONFIG_BT_HCIUART_H4=y
+CONFIG_BT_HCIUART_QCA=y
+CONFIG_BT_RFCOMM=y
+CONFIG_BT_RFCOMM_TTY=y
+CONFIG_BT_BNEP=y
+CONFIG_BT_BNEP_MC_FILTER=y
+CONFIG_BT_BNEP_PROTO_FILTER=y
+CONFIG_BT_HIDP=y
+
+# --- nethunter-wifi (Phase 5) ------------------------------------
+CONFIG_MAC80211=y
+CONFIG_ATH9K_HTC=y
+CONFIG_RTL8XXXU=y
+CONFIG_RTL8XXXU_UNTESTED=y
+
+# --- nethunter-misc (Phases 8/9/12) ------------------------------
+CONFIG_BT_HCIBTUSB=y
+CONFIG_CAN=y
+CONFIG_CAN_RAW=y
+CONFIG_CAN_BCM=y
+CONFIG_CAN_GS_USB=y
+CONFIG_NFS_FS=y
+CONFIG_NFS_V3_ACL=y
+CONFIG_NFS_V4=y
+CONFIG_ROOT_NFS=n

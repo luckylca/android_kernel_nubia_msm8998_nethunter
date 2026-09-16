@@ -1,0 +1,126 @@
+name: Build NetHunter kernel (NX563J, LineageOS 22.2)
+
+# Self-contained NetHunter kernel build for the Nubia Z17 (nx563j).
+# Produces Image.gz-dtb — the kernel payload consumed by the Kali NetHunter
+# installer (boot-patcher swaps it into the device's existing boot image).
+# Patches are already committed on this branch; config comes from
+# lineageos_nx563j_defconfig + nethunter/config/nethunter.fragment.
+
+on:
+  push:
+    branches: [nethunter-22.2]
+    paths:
+      - ".github/workflows/build.yml"
+      - "nethunter/**"
+      - "drivers/**"
+      - "arch/arm64/configs/**"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      DEFCONFIG: lineageos_nx563j_defconfig
+      CONFIG_FRAGMENT: nethunter/config/nethunter.fragment
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential ccache curl flex git libelf-dev \
+            libssl-dev python3 unzip wget xz-utils zip
+
+      - name: Download Android toolchains
+        run: |
+          mkdir -p work/toolchains/clang work/toolchains/gcc64 work/toolchains/gcc32
+          wget -q \
+            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android13-mainline-go-adbd-release/clang-r450784d.tar.gz \
+            -O work/clang.tar.gz
+          tar -xzf work/clang.tar.gz -C work/toolchains/clang
+
+          wget -q \
+            https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/android-12.1.0_r27.tar.gz \
+            -O work/gcc64.tar.gz
+          tar -xzf work/gcc64.tar.gz -C work/toolchains/gcc64
+
+          wget -q \
+            https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9/+archive/refs/tags/android-12.1.0_r27.tar.gz \
+            -O work/gcc32.tar.gz
+          tar -xzf work/gcc32.tar.gz -C work/toolchains/gcc32
+
+      - name: Reproducible build identity
+        run: |
+          source_epoch="$(git show -s --format=%ct HEAD)"
+          source_timestamp="$(LC_ALL=C date -u -d "@$source_epoch" '+%a %b %e %T UTC %Y')"
+          {
+            echo "SOURCE_DATE_EPOCH=$source_epoch"
+            echo "KBUILD_BUILD_TIMESTAMP=$source_timestamp"
+            echo "KBUILD_BUILD_USER=nx563j-nethunter-ci"
+            echo "KBUILD_BUILD_HOST=github-actions"
+            echo "KBUILD_BUILD_VERSION=1"
+          } >> "$GITHUB_ENV"
+          echo "Kernel source commit: $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Configure (defconfig + NetHunter fragment)
+        run: |
+          export PATH="$GITHUB_WORKSPACE/work/toolchains/clang/bin:$GITHUB_WORKSPACE/work/toolchains/gcc32/bin:$PATH"
+          make -j"$(nproc)" O=out ARCH=arm64 \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE="$GITHUB_WORKSPACE/work/toolchains/gcc64/bin/aarch64-linux-android-" \
+            CROSS_COMPILE_ARM32="$GITHUB_WORKSPACE/work/toolchains/gcc32/bin/arm-linux-androideabi-" \
+            CROSS_COMPILE_COMPAT="$GITHUB_WORKSPACE/work/toolchains/gcc32/bin/arm-linux-androideabi-" \
+            CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1 \
+            CLANG_TARGET_ARM32="--target=arm-linux-androideabi -B$GITHUB_WORKSPACE/work/toolchains/gcc32/bin" \
+            "$DEFCONFIG"
+          scripts/kconfig/merge_config.sh -m -O out "out/.config" "$CONFIG_FRAGMENT"
+          make -j"$(nproc)" O=out ARCH=arm64 \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE="$GITHUB_WORKSPACE/work/toolchains/gcc64/bin/aarch64-linux-android-" \
+            CROSS_COMPILE_ARM32="$GITHUB_WORKSPACE/work/toolchains/gcc32/bin/arm-linux-androideabi-" \
+            CROSS_COMPILE_COMPAT="$GITHUB_WORKSPACE/work/toolchains/gcc32/bin/arm-linux-androideabi-" \
+            CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1 \
+            CLANG_TARGET_ARM32="--target=arm-linux-androideabi -B$GITHUB_WORKSPACE/work/toolchains/gcc32/bin" \
+            olddefconfig
+
+      - name: Build
+        shell: bash
+        run: |
+          set +e
+          export PATH="$GITHUB_WORKSPACE/work/toolchains/clang/bin:$PATH"
+          mkdir -p artifacts
+          make -j"$(nproc)" O=out ARCH=arm64 \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE="$GITHUB_WORKSPACE/work/toolchains/gcc64/bin/aarch64-linux-android-" \
+            CROSS_COMPILE_ARM32="$GITHUB_WORKSPACE/work/toolchains/gcc32/bin/arm-linux-androideabi-" \
+            CROSS_COMPILE_COMPAT="$GITHUB_WORKSPACE/work/toolchains/gcc32/bin/arm-linux-androideabi-" \
+            CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1 \
+            CLANG_TARGET_ARM32="--target=arm-linux-androideabi -B$GITHUB_WORKSPACE/work/toolchains/gcc32/bin" \
+            2>&1 | tee artifacts/build.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            echo "Kernel build failed with exit code $rc"
+            grep -E -i "error:|fatal:|undefined reference|cannot find|unrecognized|unsupported|ld:|make\\[[0-9]+\\].*\\*\\*\\*" artifacts/build.log | tail -n 30 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+            exit "$rc"
+          fi
+
+      - name: Collect artifacts
+        if: always()
+        run: |
+          mkdir -p artifacts
+          printf '%s\n' "$(git rev-parse HEAD)" > artifacts/KERNEL_SOURCE_COMMIT
+          cp out/arch/arm64/boot/Image.gz-dtb artifacts/ 2>/dev/null || true
+          cp out/.config artifacts/kernel.config 2>/dev/null || true
+          cp "$CONFIG_FRAGMENT" artifacts/applied.fragment
+          sha256sum artifacts/* 2>/dev/null | grep -v build.log | tee artifacts/SHA256SUMS || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nethunter-kernel-nx563j
+          path: artifacts/
