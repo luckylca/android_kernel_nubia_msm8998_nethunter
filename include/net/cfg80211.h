@@ -5967,4 +5967,14 @@ void cfg80211_update_owe_info_event(struct net_device *netdev,
  */
 #define CFG80211_REMOVE_IEEE80211_BACKPORT 1
 
+/* Compat for the in-tree mac80211 stack and the fullmac drivers under
+ * drivers/net/wireless, which still use the pre-4.7 IEEE80211_BAND_*
+ * identifiers: this tree backported their removal into cfg80211 only.
+ * Map the old names onto the nl80211 ones so those drivers build. */
+#define IEEE80211_BAND_2GHZ	NL80211_BAND_2GHZ
+#define IEEE80211_BAND_5GHZ	NL80211_BAND_5GHZ
+#define IEEE80211_BAND_60GHZ	NL80211_BAND_60GHZ
+#define IEEE80211_NUM_BANDS	NUM_NL80211_BANDS
+#define ieee80211_band		nl80211_band
+
 #endif /* __NET_CFG80211_H */
