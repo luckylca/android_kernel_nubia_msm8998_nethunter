@@ -2005,6 +2005,19 @@ static int __hdd_mon_open(struct net_device *dev)
 		return -EINVAL;
 	}
 
+	/* 2026-09-12 (ported from Loukious/Kali monitor-injection): duplicate
+	 * ifup while monitor mode is active is idempotent — only re-assert
+	 * carrier/queues, never re-create the monitor session.
+	 */
+	if (test_bit(DEVICE_IFACE_OPENED, &adapter->event_flags)) {
+		wlan_hdd_netif_queue_control(adapter,
+					     WLAN_START_ALL_NETIF_QUEUE_N_CARRIER,
+					     WLAN_CONTROL_PATH);
+		wma_mon_inject_rearm();
+		pr_err("mon-open: duplicate ifup, carrier/queues re-asserted\n");
+		return 0;
+	}
+
 	hdd_mon_mode_ether_setup(dev);
 
 	if (cds_get_conparam() == QDF_GLOBAL_MONITOR_MODE)
@@ -2012,8 +2025,26 @@ static int __hdd_mon_open(struct net_device *dev)
 	else
 		ret = hdd_set_mon_mode_cb(dev);
 
+	if (ret)
+		return ret;
+
 	set_bit(DEVICE_IFACE_OPENED, &adapter->event_flags);
-	return ret;
+
+	/* The monitor netdev never gets carrier/TX queues started anywhere
+	 * else: the interface comes up NO-CARRIER with all TX queues
+	 * XOFF-stopped, so dev_queue_xmit() never reaches ndo_start_xmit and
+	 * injected frames are swallowed silently (diagnosed 2026-09-12:
+	 * send() returns len, qdisc/softnet/nit counters all flat, one-shot
+	 * hdd_mon_tx printk never fires). Bring carrier and queues up here
+	 * exactly like the station open path does.
+	 */
+	wlan_hdd_netif_queue_control(adapter,
+				     WLAN_START_ALL_NETIF_QUEUE_N_CARRIER,
+				     WLAN_CONTROL_PATH);
+	wma_mon_inject_rearm();	/* clear cleanup's stopping flag (Phase 3) */
+	pr_err("mon-open: monitor if=%s carrier/tx queues started\n",
+	       dev->name);
+	return 0;
 }
 
 /**
@@ -2762,8 +2793,11 @@ static int __hdd_stop(struct net_device *dev)
 		hdd_lpass_notify_stop(hdd_ctx);
 	}
 
-	if (wlan_hdd_is_session_type_monitor(adapter->device_mode))
+	if (wlan_hdd_is_session_type_monitor(adapter->device_mode)) {
+		/* destroy injection helper vdev before mon vdev teardown */
+		wma_mon_inject_cleanup();
 		hdd_reset_mon_mode_cb();
+	}
 
 	/*
 	 * NAN data interface is different in some sense. The traffic on NDI is
@@ -3266,10 +3300,13 @@ static const struct net_device_ops wlan_drv_ops = {
 #endif
 };
 
-/* Monitor mode net_device_ops, doesnot Tx and most of operations. */
+/* Monitor mode net_device_ops, most operations omitted.
+ * ndo_start_xmit enables 802.11 frame injection (NX563J NetHunter).
+ */
 static const struct net_device_ops wlan_mon_drv_ops = {
 	.ndo_open = hdd_mon_open,
 	.ndo_stop = hdd_stop,
+	.ndo_start_xmit = hdd_mon_tx,
 	.ndo_get_stats = hdd_get_stats,
 };
 
@@ -13050,6 +13087,8 @@ static void hdd_stop_present_mode(hdd_context_t *hdd_ctx,
 	switch (curr_mode) {
 	case QDF_GLOBAL_MONITOR_MODE:
 		hdd_info("Release wakelock for monitor mode!");
+		/* destroy injection helper vdev before mon vdev teardown */
+		wma_mon_inject_cleanup();
 		qdf_wake_lock_release(&hdd_ctx->monitor_mode_wakelock,
 				      WIFI_POWER_EVENT_WAKELOCK_MONITOR_MODE);
 		/* fallthrough */

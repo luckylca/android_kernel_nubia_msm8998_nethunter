@@ -2586,6 +2586,12 @@ void wma_register_packetdump_callback(
 		tp_wma_packetdump_cb wma_mgmt_tx_packetdump_cb,
 		tp_wma_packetdump_cb wma_mgmt_rx_packetdump_cb);
 void wma_deregister_packetdump_callback(void);
+
+/* Monitor-mode frame injection (NX563J NetHunter) — also in wma_api.h */
+QDF_STATUS wma_mon_inject_frame(uint8_t mon_vdev_id, const uint8_t *frame,
+				uint16_t frame_len);
+void wma_mon_inject_cleanup(void);
+void wma_mon_inject_rearm(void);
 void wma_update_sta_inactivity_timeout(tp_wma_handle wma,
 		struct sme_sta_inactivity_timeout  *sta_inactivity_timer);
 

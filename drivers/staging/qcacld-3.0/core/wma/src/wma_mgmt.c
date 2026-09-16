@@ -24,6 +24,10 @@
 
 /* Header files */
 
+#include <linux/slab.h>
+#include <linux/workqueue.h>
+#include <linux/list.h>
+#include <linux/spinlock.h>
 #include "wma.h"
 #include "wma_api.h"
 #include "cds_api.h"
@@ -4442,4 +4446,457 @@ void wma_deregister_packetdump_callback(void)
 
 	wma_handle->wma_mgmt_tx_packetdump_cb = NULL;
 	wma_handle->wma_mgmt_rx_packetdump_cb = NULL;
+}
+
+/*
+ * =========================================================================
+ * Monitor-mode frame injection (NX563J NetHunter port)
+ *
+ * Minimal port of the Loukious QCACLD-3.0 injection mechanism (shipped in
+ * Kali 2026.1, android_kernel_xiaomi_sm8150 8f0698bf) to
+ * wlan-cmn.driver.lnx.1.0 (qcacld v5.1.1) on 4.4:
+ *
+ * The firmware mgmt-TX handler rejects MONITOR vdevs (falls into a
+ * beacon-only path -> DISCARD).  Injection therefore goes through a hidden
+ * STA-type helper vdev: VDEV_CREATE(STA) -> VDEV_START(monitor channel)
+ * -> PEER_CREATE(self) -- deliberately NO VDEV_UP (a STA vdev_up asserts
+ * without a BSS peer).  Frames are then submitted with
+ * WMI_MGMT_TX_SEND_CMDID naming the helper vdev.
+ *
+ * hdd calls wma_mon_inject_frame() from ndo_start_xmit (BH context, must
+ * not sleep); frames are queued and submitted from a workqueue where the
+ * WMI round trips and msleep()s are legal.
+ * =========================================================================
+ */
+
+/* qdf trace is routed to the userspace logging socket on this build
+ * (Kbuild defines WLAN_LOGGING_SOCK_SVC_ENABLE), so WMA_LOGx never
+ * reaches dmesg.  Use raw printk for injection diagnostics.
+ */
+#define MON_INJ_LOG(args ...) pr_err("mon-inject: " args)
+#define MON_INJ_LOG_RL(args ...) pr_err_ratelimited("mon-inject: " args)
+
+#define WMA_MON_INJECT_MAX_LEN		1600
+#define WMA_MON_INJECT_QUEUE_MAX	64
+
+struct wma_mon_inject_node {
+	struct list_head list;
+	uint8_t mon_vdev_id;
+	uint16_t len;
+	uint8_t frame[];
+};
+
+struct wma_mon_inject_ctx {
+	struct list_head queue;
+	spinlock_t lock;
+	uint32_t queue_len;
+	bool created;
+	bool stopping;	/* set by cleanup; drops all further frames until rearm */
+	uint8_t vdev_id;
+	uint8_t mon_vdev_id;
+	uint32_t chanfreq;
+	uint8_t mac[QDF_MAC_ADDR_SIZE];
+	uint32_t tx_ok;
+	uint32_t tx_fail;
+	uint32_t tx_drop;
+};
+
+static struct wma_mon_inject_ctx g_mon_inj = {
+	.queue = LIST_HEAD_INIT(g_mon_inj.queue),
+	.lock = __SPIN_LOCK_UNLOCKED(g_mon_inj.lock),
+};
+
+static void wma_mon_inject_work_fn(struct work_struct *work);
+static DECLARE_WORK(g_mon_inj_work, wma_mon_inject_work_fn);
+
+/**
+ * wma_mon_inject_vdev_destroy() - tear down the hidden TX helper vdev
+ * @wma_handle: wma handle
+ *
+ * Reverse order of create with msleep gaps so firmware finishes each
+ * step before the next command arrives (FW asserts otherwise).
+ * Must run in process context, before the monitor vdev is torn down.
+ */
+static void wma_mon_inject_vdev_destroy(tp_wma_handle wma_handle)
+{
+	if (!g_mon_inj.created)
+		return;
+
+	if (wma_handle && wma_handle->wmi_handle) {
+		wmi_unified_peer_delete_send(wma_handle->wmi_handle,
+					     g_mon_inj.mac,
+					     g_mon_inj.vdev_id);
+		msleep(100);
+		wmi_unified_vdev_stop_send(wma_handle->wmi_handle,
+					   g_mon_inj.vdev_id);
+		msleep(100);
+		wmi_unified_vdev_delete_send(wma_handle->wmi_handle,
+					     g_mon_inj.vdev_id);
+		msleep(100);
+		MON_INJ_LOG("helper vdev %u destroyed",
+			 g_mon_inj.vdev_id);
+	}
+	g_mon_inj.created = false;
+}
+
+/**
+ * wma_mon_inject_vdev_ensure() - create hidden STA helper vdev if needed
+ * @wma_handle: wma handle
+ * @mon_vdev_id: monitor vdev id (source of MAC + channel)
+ * @chanfreq: monitor channel frequency in MHz
+ *
+ * Return: QDF_STATUS_SUCCESS when the helper vdev is ready
+ */
+static QDF_STATUS wma_mon_inject_vdev_ensure(tp_wma_handle wma_handle,
+					     uint8_t mon_vdev_id,
+					     uint32_t chanfreq)
+{
+	struct vdev_create_params vcreate = {0};
+	struct vdev_start_params vstart = {0};
+	struct peer_create_params pcreate = {0};
+	uint8_t inj_mac[QDF_MAC_ADDR_SIZE];
+	WLAN_PHY_MODE phymode;
+	QDF_STATUS status;
+	uint8_t chan;
+	int i, vid = -1;
+
+	if (g_mon_inj.created) {
+		if (g_mon_inj.chanfreq == chanfreq)
+			return QDF_STATUS_SUCCESS;
+		/* monitor channel changed: recreate on the new channel */
+		wma_mon_inject_vdev_destroy(wma_handle);
+	}
+
+	for (i = wma_handle->max_bssid - 1; i >= 0; i--) {
+		if (i == mon_vdev_id)
+			continue;
+		if (!wma_is_vdev_valid(i)) {
+			vid = i;
+			break;
+		}
+	}
+	if (vid < 0) {
+		MON_INJ_LOG("no free vdev slot");
+		return QDF_STATUS_E_RESOURCES;
+	}
+
+	qdf_mem_copy(inj_mac, wma_handle->interfaces[mon_vdev_id].addr,
+		     QDF_MAC_ADDR_SIZE);
+	inj_mac[0] |= 0x02; /* locally administered */
+
+	/* STA type: AP would crash FW beacon TX offload (no bcn template) */
+	vcreate.if_id = vid;
+	vcreate.type = WMI_VDEV_TYPE_STA;
+	vcreate.subtype = 0;
+	vcreate.nss_2g = 1;
+	vcreate.nss_5g = 1;
+	status = wmi_unified_vdev_create_send(wma_handle->wmi_handle,
+					      inj_mac, &vcreate);
+	if (QDF_IS_STATUS_ERROR(status)) {
+		MON_INJ_LOG("vdev create failed: %d", status);
+		return status;
+	}
+	msleep(150);
+
+	chan = cds_freq_to_chan(chanfreq);
+	phymode = wma_chan_phy_mode(chan, CH_WIDTH_20MHZ,
+				    WNI_CFG_DOT11_MODE_11AC);
+	if (phymode == MODE_UNKNOWN)
+		phymode = CDS_IS_CHANNEL_5GHZ(chan) ? MODE_11A : MODE_11G;
+
+	vstart.vdev_id = vid;
+	vstart.chan_freq = chanfreq;
+	vstart.band_center_freq1 = chanfreq;
+	vstart.band_center_freq2 = 0;
+	vstart.chan_mode = phymode;
+	vstart.beacon_intval = 0;
+	vstart.dtim_period = 0;
+	vstart.max_txpow = 20;
+	status = wmi_unified_vdev_start_send(wma_handle->wmi_handle, &vstart);
+	if (QDF_IS_STATUS_ERROR(status)) {
+		MON_INJ_LOG("vdev start failed: %d", status);
+		goto err_delete;
+	}
+	msleep(150);
+
+	pcreate.peer_addr = inj_mac;
+	pcreate.peer_type = WMI_PEER_TYPE_DEFAULT;
+	pcreate.vdev_id = vid;
+	status = wmi_unified_peer_create_send(wma_handle->wmi_handle,
+					      &pcreate);
+	if (QDF_IS_STATUS_ERROR(status)) {
+		MON_INJ_LOG("peer create failed: %d", status);
+		goto err_stop;
+	}
+	msleep(100);
+
+	g_mon_inj.created = true;
+	g_mon_inj.vdev_id = vid;
+	g_mon_inj.mon_vdev_id = mon_vdev_id;
+	g_mon_inj.chanfreq = chanfreq;
+	qdf_mem_copy(g_mon_inj.mac, inj_mac, QDF_MAC_ADDR_SIZE);
+
+	MON_INJ_LOG("helper vdev %u (STA, mac %pM) on %u MHz for monitor vdev %u",
+		 vid, inj_mac, chanfreq, mon_vdev_id);
+	return QDF_STATUS_SUCCESS;
+
+err_stop:
+	wmi_unified_vdev_stop_send(wma_handle->wmi_handle, vid);
+	msleep(100);
+err_delete:
+	wmi_unified_vdev_delete_send(wma_handle->wmi_handle, vid);
+	msleep(100);
+	return status;
+}
+
+/**
+ * wma_mon_inject_tx_cmpl() - mgmt TX download/OTA completion for injection
+ * @context: mac context (unused)
+ * @data: the injected nbuf, ownership passed to us
+ * @free_data: true
+ *
+ * The generic completion handler (wma_process_mgmt_tx_completion) has
+ * already unmapped the nbuf; we just free it.
+ */
+static void wma_mon_inject_tx_cmpl(void *context, void *data, bool free_data)
+{
+	if (data)
+		qdf_nbuf_free((qdf_nbuf_t)data);
+}
+
+/**
+ * wma_mon_inject_tx() - submit one queued frame to firmware
+ * @wma_handle: wma handle
+ * @node: queued frame
+ */
+static void wma_mon_inject_tx(tp_wma_handle wma_handle,
+			      struct wma_mon_inject_node *node)
+{
+	struct wmi_mgmt_params mgmt_param = {0};
+	struct wmi_desc_t *wmi_desc;
+	qdf_nbuf_t nbuf;
+	uint8_t *pdata;
+	uint32_t chanfreq;
+	QDF_STATUS status;
+
+	if (!wma_handle->wmi_ready || !wma_handle->wmi_handle) {
+		MON_INJ_LOG_RL("drop: wmi not ready");
+		goto drop;
+	}
+
+	if (node->mon_vdev_id >= wma_handle->max_bssid ||
+	    !wma_is_vdev_valid(node->mon_vdev_id) ||
+	    wma_handle->interfaces[node->mon_vdev_id].type !=
+						WMI_VDEV_TYPE_MONITOR) {
+		MON_INJ_LOG_RL("drop: vdev %u invalid/not-monitor (valid=%d type=%u)",
+			node->mon_vdev_id,
+			node->mon_vdev_id < wma_handle->max_bssid ?
+				wma_is_vdev_valid(node->mon_vdev_id) : -1,
+			node->mon_vdev_id < wma_handle->max_bssid ?
+				wma_handle->interfaces[node->mon_vdev_id].type : 0);
+		goto drop;
+	}
+
+	chanfreq = wma_handle->interfaces[node->mon_vdev_id].mhz;
+	if (!chanfreq) {
+		MON_INJ_LOG_RL("drop: monitor vdev %u has zero channel",
+			node->mon_vdev_id);
+		goto drop;
+	}
+
+	if (QDF_IS_STATUS_ERROR(wma_mon_inject_vdev_ensure(
+					wma_handle, node->mon_vdev_id,
+					chanfreq))) {
+		MON_INJ_LOG_RL("drop: helper vdev ensure failed");
+		goto drop;
+	}
+
+	nbuf = qdf_nbuf_alloc(cds_get_context(QDF_MODULE_ID_QDF_DEVICE),
+			      node->len, 0, 0, false);
+	if (!nbuf) {
+		MON_INJ_LOG_RL("drop: nbuf alloc failed");
+		goto drop;
+	}
+
+	pdata = qdf_nbuf_put_tail(nbuf, node->len);
+	if (!pdata) {
+		qdf_nbuf_free(nbuf);
+		goto drop;
+	}
+	qdf_mem_copy(pdata, node->frame, node->len);
+
+	wmi_desc = wmi_desc_get(wma_handle);
+	if (!wmi_desc) {
+		qdf_nbuf_free(nbuf);
+		MON_INJ_LOG_RL("drop: wmi desc pool exhausted");
+		goto drop;
+	}
+
+	mgmt_param.tx_frame = nbuf;
+	mgmt_param.frm_len = node->len;
+	mgmt_param.vdev_id = g_mon_inj.vdev_id;
+	mgmt_param.pdata = pdata;
+	mgmt_param.chanfreq = chanfreq;
+	mgmt_param.qdf_ctx = cds_get_context(QDF_MODULE_ID_QDF_DEVICE);
+	mgmt_param.tx_params_valid = false;
+	mgmt_param.desc_id = wmi_desc->desc_id;
+	wmi_desc->vdev_id = g_mon_inj.vdev_id;
+	wmi_desc->nbuf = nbuf;
+	wmi_desc->tx_cmpl_cb = wma_mon_inject_tx_cmpl;
+	wmi_desc->ota_post_proc_cb = NULL;
+
+	status = wmi_mgmt_unified_cmd_send(wma_handle->wmi_handle,
+					   &mgmt_param);
+	if (QDF_IS_STATUS_ERROR(status)) {
+		wmi_desc->nbuf = NULL;
+		wmi_desc_put(wma_handle, wmi_desc);
+		qdf_nbuf_free(nbuf);
+		g_mon_inj.tx_fail++;
+		MON_INJ_LOG("WMI mgmt TX failed: %d", status);
+		return;
+	}
+
+	g_mon_inj.tx_ok++;
+	if (g_mon_inj.tx_ok == 1)
+		MON_INJ_LOG("first frame submitted, desc_id=%u vdev=%u len=%u chan=%u",
+			 mgmt_param.desc_id, mgmt_param.vdev_id,
+			 node->len, chanfreq);
+	return;
+
+drop:
+	g_mon_inj.tx_drop++;
+	if (g_mon_inj.tx_drop == 1 || !(g_mon_inj.tx_drop % 100))
+		MON_INJ_LOG("drop count %u (ok=%u fail=%u)",
+			 g_mon_inj.tx_drop, g_mon_inj.tx_ok, g_mon_inj.tx_fail);
+}
+
+static void wma_mon_inject_work_fn(struct work_struct *work)
+{
+	struct wma_mon_inject_node *node;
+	tp_wma_handle wma_handle;
+	unsigned long flags;
+
+	wma_handle = cds_get_context(QDF_MODULE_ID_WMA);
+
+	for (;;) {
+		spin_lock_irqsave(&g_mon_inj.lock, flags);
+		if (list_empty(&g_mon_inj.queue)) {
+			spin_unlock_irqrestore(&g_mon_inj.lock, flags);
+			break;
+		}
+		node = list_first_entry(&g_mon_inj.queue,
+					struct wma_mon_inject_node, list);
+		list_del(&node->list);
+		g_mon_inj.queue_len--;
+		spin_unlock_irqrestore(&g_mon_inj.lock, flags);
+
+		if (wma_handle)
+			wma_mon_inject_tx(wma_handle, node);
+		kfree(node);
+	}
+}
+
+/**
+ * wma_mon_inject_frame() - queue a raw 802.11 frame for injection
+ * @mon_vdev_id: monitor vdev id (hdd adapter sessionId)
+ * @frame: raw 802.11 frame (radiotap already stripped)
+ * @frame_len: frame length
+ *
+ * Callable from BH context (ndo_start_xmit); never sleeps.
+ *
+ * Return: QDF_STATUS
+ */
+QDF_STATUS wma_mon_inject_frame(uint8_t mon_vdev_id, const uint8_t *frame,
+				uint16_t frame_len)
+{
+	struct wma_mon_inject_node *node;
+	unsigned long flags;
+
+	if (!frame || frame_len < 24 || frame_len > WMA_MON_INJECT_MAX_LEN)
+		return QDF_STATUS_E_INVAL;
+
+	node = kmalloc(sizeof(*node) + frame_len, GFP_ATOMIC);
+	if (!node)
+		return QDF_STATUS_E_NOMEM;
+
+	node->mon_vdev_id = mon_vdev_id;
+	node->len = frame_len;
+	qdf_mem_copy(node->frame, frame, frame_len);
+
+	spin_lock_irqsave(&g_mon_inj.lock, flags);
+	/* 2026-09-12 (Phase 3): once cleanup runs, every late frame must be
+	 * dropped. Without this, a TX racing/after teardown re-armed the work
+	 * item, which then RE-CREATED the helper STA vdev while the monitor
+	 * vdev (or the whole driver) was being torn down — the orphaned-vdev
+	 * firmware assert this file's cleanup ordering exists to avoid, and a
+	 * prime suspect for the monitor->mission switch wedge.
+	 */
+	if (g_mon_inj.stopping) {
+		spin_unlock_irqrestore(&g_mon_inj.lock, flags);
+		kfree(node);
+		g_mon_inj.tx_drop++;
+		MON_INJ_LOG_RL("drop: stopping (frame after cleanup)");
+		return QDF_STATUS_E_RESOURCES;
+	}
+	if (g_mon_inj.queue_len >= WMA_MON_INJECT_QUEUE_MAX) {
+		spin_unlock_irqrestore(&g_mon_inj.lock, flags);
+		kfree(node);
+		g_mon_inj.tx_drop++;
+		return QDF_STATUS_E_RESOURCES;
+	}
+	list_add_tail(&node->list, &g_mon_inj.queue);
+	g_mon_inj.queue_len++;
+	spin_unlock_irqrestore(&g_mon_inj.lock, flags);
+
+	schedule_work(&g_mon_inj_work);
+	return QDF_STATUS_SUCCESS;
+}
+
+/**
+ * wma_mon_inject_cleanup() - purge queue and destroy helper vdev
+ *
+ * Must be called in process context before the monitor vdev is torn
+ * down (hdd_stop for the monitor adapter / con_mode switch): the
+ * firmware asserts in dispatch_wlan_pdev_cmds if an orphaned STA
+ * helper vdev outlives the monitor vdev.
+ */
+void wma_mon_inject_cleanup(void)
+{
+	struct wma_mon_inject_node *node, *tmp;
+	tp_wma_handle wma_handle;
+	unsigned long flags;
+
+	/* stop accepting new frames FIRST (under lock), so no new work can
+	 * be armed behind cancel_work_sync() */
+	spin_lock_irqsave(&g_mon_inj.lock, flags);
+	g_mon_inj.stopping = true;
+	spin_unlock_irqrestore(&g_mon_inj.lock, flags);
+
+	cancel_work_sync(&g_mon_inj_work);
+
+	spin_lock_irqsave(&g_mon_inj.lock, flags);
+	list_for_each_entry_safe(node, tmp, &g_mon_inj.queue, list) {
+		list_del(&node->list);
+		kfree(node);
+	}
+	g_mon_inj.queue_len = 0;
+	spin_unlock_irqrestore(&g_mon_inj.lock, flags);
+
+	wma_handle = cds_get_context(QDF_MODULE_ID_WMA);
+	wma_mon_inject_vdev_destroy(wma_handle);
+}
+
+/**
+ * wma_mon_inject_rearm() - allow injection again for a new monitor session
+ *
+ * Called from the monitor interface open path. Clears the stopping flag
+ * set by wma_mon_inject_cleanup() when the previous session was torn down.
+ */
+void wma_mon_inject_rearm(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&g_mon_inj.lock, flags);
+	g_mon_inj.stopping = false;
+	spin_unlock_irqrestore(&g_mon_inj.lock, flags);
 }

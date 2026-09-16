@@ -853,6 +853,64 @@ static inline bool hdd_is_tx_allowed(struct sk_buff *skb, uint8_t peer_id)
 }
 
 /**
+ * hdd_mon_tx() - monitor-mode frame injection xmit (NX563J NetHunter)
+ * @skb: radiotap + 802.11 frame (or raw 802.11) from AF_PACKET write
+ * @dev: monitor netdev (wlan0 in con_mode=4)
+ *
+ * The monitor netdev ops normally have no TX path.  This strips the
+ * radiotap header and hands the raw 802.11 frame to WMA, which injects
+ * it through firmware mgmt TX via a hidden STA helper vdev.
+ *
+ * Runs in BH context: must not sleep (WMA side queues to a workqueue).
+ *
+ * Return: Always NETDEV_TX_OK (skb always consumed)
+ */
+netdev_tx_t hdd_mon_tx(struct sk_buff *skb, struct net_device *dev)
+{
+	hdd_adapter_t *adapter = WLAN_HDD_GET_PRIV_PTR(dev);
+	uint16_t rtap_len = 0;
+	uint16_t frame_len;
+	const uint8_t *frame;
+
+	if (skb->len >= sizeof(struct ieee80211_radiotap_header)) {
+		struct ieee80211_radiotap_header *rth =
+			(struct ieee80211_radiotap_header *)skb->data;
+
+		if (rth->it_version == 0) {
+			uint16_t len = ieee80211_get_radiotap_len(skb->data);
+
+			if (len >= sizeof(*rth) && len < skb->len)
+				rtap_len = len;
+		}
+	}
+
+	frame = skb->data + rtap_len;
+	frame_len = skb->len - rtap_len;
+
+	{
+		static bool mon_tx_logged;
+
+		if (!mon_tx_logged) {
+			/* qdf trace goes to the logging socket on this
+			 * build; raw printk stays visible in dmesg */
+			pr_err("mon tx: first frame, skb_len=%u rtap=%u frame_len=%u session=%u\n",
+			       skb->len, rtap_len, frame_len,
+			       adapter->sessionId);
+			mon_tx_logged = true;
+		}
+	}
+
+	/* minimum sane 802.11 frame: 24-byte mgmt header */
+	if (frame_len >= 24)
+		wma_mon_inject_frame(adapter->sessionId, frame, frame_len);
+	else
+		pr_err_ratelimited("mon tx: runt frame %u\n", frame_len);
+
+	dev_kfree_skb(skb);
+	return NETDEV_TX_OK;
+}
+
+/**
  * __hdd_hard_start_xmit() - Transmit a frame
  * @skb: pointer to OS packet (sk_buff)
  * @dev: pointer to network device
