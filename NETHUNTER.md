@@ -23,8 +23,12 @@ defconfig), WCN3990 HCIUART + RFCOMM/BNEP/HIDP, MAC80211 + ath9k_htc +
 rtl8xxxu for external USB Wi-Fi, btusb USB BT dongles, SocketCAN gs_usb,
 NFS client.
 
-Note: RNDIS is intentionally disabled — enabling it on this 4.4 tree makes
-rndis.o link into three composite objects and the build drops it.
+Note on RNDIS: legacy `f_rndis` is intentionally disabled (it would link
+rndis.o into three composite objects on this 4.4 tree), but RNDIS gadget
+functionality IS available via the Qualcomm GSI path — the defconfig ships
+`CONFIG_USB_CONFIGFS_F_GSI=y` + `CONFIG_RNDIS_IPA=y`, and `gsi.rndis` was
+verified creatable in configfs on the running kernel (2026-09-16). The
+NetHunter `win,rndis*` USB attack modes work through it unchanged.
 
 ## Build
 
