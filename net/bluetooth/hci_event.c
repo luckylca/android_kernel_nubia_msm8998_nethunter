@@ -1347,7 +1347,12 @@ static void hci_cc_write_le_host_supported(struct hci_dev *hdev,
 
 	BT_DBG("%s status 0x%2.2x", hdev->name, status);
 
-	if (status)
+	/* NX563J: the WCN3990, initialized by userspace hci_qcomm_init
+	 * (TLV rampatch + crnv21.bin NVM), already has LE_Host_Supported
+	 * set and answers a redundant write with Command Disallowed
+	 * (0x0c). The desired state is in effect; treat it as success.
+	 */
+	if (status && status != 0x0c)
 		return;
 
 	sent = hci_sent_cmd_data(hdev, HCI_OP_WRITE_LE_HOST_SUPPORTED);

@@ -4435,6 +4435,18 @@ void hci_req_cmd_complete(struct hci_dev *hdev, u16 opcode, u8 status,
 		return;
 	}
 
+	/* NX563J: a Write LE Host Supported answered with Command
+	 * Disallowed (0x0c) means the chip already has the bit set
+	 * (userspace NVM; see hci_cc_write_le_host_supported). Do not
+	 * abort the whole init request over it.
+	 */
+	if (opcode == HCI_OP_WRITE_LE_HOST_SUPPORTED && status == 0x0c) {
+		if (hci_req_is_complete(hdev))
+			status = 0;
+		else
+			return;
+	}
+
 	/* If the command succeeded and there's still more commands in
 	 * this request the request is not yet complete.
 	 */
