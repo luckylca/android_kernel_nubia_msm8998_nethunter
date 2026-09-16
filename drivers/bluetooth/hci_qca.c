@@ -463,7 +463,7 @@ static int qca_open(struct hci_uart *hu)
 	return 0;
 }
 
-static void qca_debugfs_init(struct hci_dev *hdev)
+static void __maybe_unused qca_debugfs_init(struct hci_dev *hdev)
 {
 	struct hci_uart *hu = hci_get_drvdata(hdev);
 	struct qca_data *qca = hu->priv;
@@ -944,21 +944,20 @@ static int qca_setup(struct hci_uart *hu)
 		hci_uart_set_baudrate(hu, speed);
 	}
 
-	/* Setup patch / NVM configurations */
-	ret = qca_uart_setup_rome(hdev, qca_baudrate);
-	if (!ret) {
-		set_bit(STATE_IN_BAND_SLEEP_ENABLED, &qca->flags);
-		qca_debugfs_init(hdev);
-	} else if (ret == -ENOENT) {
-		/* No patch/nvm-config found, run with original fw/config */
-		ret = 0;
-	} else if (ret == -EAGAIN) {
-		/*
-		 * Userspace firmware loader will return -EAGAIN in case no
-		 * patch/nvm-config is found, so run with original fw/config.
-		 */
-		ret = 0;
-	}
+	/* NX563J: skip the kernel-side EDL rome download. The TLV
+	 * rampatch+NVM is downloaded in USERSPACE by
+	 * /vendor/bin/hci_qcomm_init before the hci_uart ldisc is attached
+	 * (the same split stock Android uses with wcnss_filter). The
+	 * already-initialized chip answers the EDL version request with
+	 * HCI status 0x0c (Command Disallowed -> EBUSY), failing HCIDEVUP.
+	 * The baud switch above is still required: hci_qcomm_init leaves
+	 * the chip listening at 115200 and it follows the VS baud command
+	 * to the operational speed. Leave IBS off (the -ENOENT path does
+	 * too): with in-band sleep enabled, every post-setup command parks
+	 * in tx_wait_q waiting for a WAKE_ACK the chip never sends, and
+	 * __hci_init times out (-ETIMEDOUT on HCIDEVUP).
+	 */
+	ret = 0;
 
 	/* Setup bdaddr */
 	hu->hdev->set_bdaddr = qca_set_bdaddr_rome;
