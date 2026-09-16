@@ -74,3 +74,8 @@ ath9k_htc-y +=	htc_hst.o \
 ath9k_htc-$(CONFIG_ATH9K_HTC_DEBUGFS) += htc_drv_debug.o
 
 obj-$(CONFIG_ATH9K_HTC) += ath9k_htc.o
+
+# 2026-09-14: clang -Werror turns the eeprom regdomain int->u8 narrowing
+# into a hard error on this 4.4 tree; the values are intentional (dBm
+# tables), so demote just this file.
+CFLAGS_ar9003_eeprom.o += -Wno-constant-conversion
