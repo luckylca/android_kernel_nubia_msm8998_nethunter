@@ -5271,11 +5271,59 @@ static void resume_work_func(struct work_struct *work)
 	struct synaptics_rmi4_data *rmi4_data =
 		container_of(work, struct synaptics_rmi4_data,
 			resume_work);
+	unsigned char probe_byte = 0;
+	int ret, attempt;
 
 	dev = &rmi4_data->pdev->dev;
-	dev_info(dev, "resume workqueue start\n");
-	synaptics_rmi4_resume(dev);
-	dev_info(dev, "resume workqueue finish\n");
+
+	/*
+	 * nx563j: the in-cell touch IC is not ready for I2C immediately
+	 * after the rail/power handoff at boot. When the first contact
+	 * happens too early (our kernels fire the fb unblank ~1.9 s into
+	 * boot vs ~18 s on stock) every read NAKs, and the recovery loop
+	 * below (sw/hw reset every ~0.6 s) then keeps the IC from ever
+	 * finishing its own power-up, leaving it dead until the next
+	 * cold boot. Defer early resumes until the IC can be ready,
+	 * then verify it actually answers; if it still NAKs, cycle the
+	 * rails through suspend and retry the full resume.
+	 */
+	while (ktime_get_seconds() < 20) {
+		dev_info(dev, "[TP]resume deferred until touch IC ready\n");
+		msleep(500);
+	}
+
+	for (attempt = 0; attempt < 8; attempt++) {
+		dev_info(dev, "resume workqueue start (attempt %d)\n",
+				attempt + 1);
+		synaptics_rmi4_resume(dev);
+		ret = synaptics_rmi4_reg_read(rmi4_data,
+				rmi4_data->f01_query_base_addr, &probe_byte, 1);
+		if (ret < 0) {
+			dev_err(dev, "[TP]touch IC still NAK after resume, cycling rails\n");
+			msleep(4000);
+			synaptics_rmi4_suspend(dev);
+			msleep(1000);
+			continue;
+		}
+		/*
+		 * The reset that synaptics_rmi4_resume() always issues
+		 * empties the function handler list and re-queries the IC;
+		 * when that query races the IC's own reboot the list stays
+		 * empty and touch silently never reports again (irqs fire
+		 * but there is no F12 handler). Rebuild it now that the IC
+		 * is settled.
+		 */
+		if (list_empty(&rmi4_data->rmi4_mod_info.support_fn_list)) {
+			dev_err(dev, "[TP]IC alive but fn list empty, rebuilding\n");
+			synaptics_rmi4_reset_device(rmi4_data, false);
+			msleep(1000);
+			continue;
+		}
+		dev_info(dev, "resume workqueue finish (IC alive)\n");
+		return;
+	}
+	dev_err(dev, "resume workqueue finish (IC dead after %d attempts)\n",
+			attempt);
 }
 #endif
 
