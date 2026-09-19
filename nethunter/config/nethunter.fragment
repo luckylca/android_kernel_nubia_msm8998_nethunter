@@ -3,10 +3,11 @@
 # Union of the Ubuntu-phase capability fragments (nubiaz17_linux project):
 #   usb-diag      gadget serial/ecm/acm (configfs)
 #   bt            WCN3990 HCIUART + RFCOMM/BNEP/HIDP
-#   nethunter-wifi  external USB Wi-Fi: MAC80211 + ath9k_htc + rtl8xxxu
+#   nethunter-wifi  external USB Wi-Fi: ath9k_htc + rtl8xxxu + rtl88xxau
 #   nethunter-misc  USB BT dongle (btusb), SocketCAN gs_usb, NFS client
 # Rules: keep CONFIG_* tokens out of comment text; no USB_G_SERIAL/USB_G_NCM
-# (configfs choice conflict); no RNDIS (multi-composite link error on 4.4).
+# (configfs choice conflict). RNDIS is provided by the downstream GSI path;
+# CONFIGFS_F_GSI was verified on-device, so no separate RNDIS patch is needed.
 
 # --- usb-diag ----------------------------------------------------
 CONFIG_DEVTMPFS=y
@@ -37,6 +38,9 @@ CONFIG_MAC80211=y
 CONFIG_ATH9K_HTC=y
 CONFIG_RTL8XXXU=y
 CONFIG_RTL8XXXU_UNTESTED=y
+# Kali NetHunter 2026.2 4.04 patch: aircrack-ng rtl8812au/rtl8821au/rtl8814au.
+# Built in to avoid a separate module payload in the NetHunter installer.
+CONFIG_88XXAU=y
 
 # --- nethunter-misc (Phases 8/9/12) ------------------------------
 CONFIG_BT_HCIBTUSB=y
