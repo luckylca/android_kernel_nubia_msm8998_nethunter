@@ -35,22 +35,65 @@ jobs:
             libssl-dev python3 unzip wget xz-utils zip
 
       - name: Download Android toolchains
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p work/toolchains/clang work/toolchains/gcc64 work/toolchains/gcc32
-          wget -q \
-            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android13-mainline-go-adbd-release/clang-r450784d.tar.gz \
-            -O work/clang.tar.gz
-          tar -xzf work/clang.tar.gz -C work/toolchains/clang
 
-          wget -q \
-            https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/android-12.1.0_r27.tar.gz \
-            -O work/gcc64.tar.gz
-          tar -xzf work/gcc64.tar.gz -C work/toolchains/gcc64
+          fetch_archive() {
+            local url="$1" out="$2"
+            local attempt
+            for attempt in 1 2 3; do
+              echo "download attempt ${attempt}: ${url}"
+              if curl --fail --location --silent --show-error \
+                --connect-timeout 20 --max-time 300 \
+                --retry 2 --retry-delay 2 --retry-all-errors \
+                "$url" -o "$out"; then
+                return 0
+              fi
+              sleep $((attempt * 3))
+            done
+            return 1
+          }
 
-          wget -q \
-            https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9/+archive/refs/tags/android-12.1.0_r27.tar.gz \
-            -O work/gcc32.tar.gz
-          tar -xzf work/gcc32.tar.gz -C work/toolchains/gcc32
+          CLANG_URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android13-mainline-go-adbd-release/clang-r450784d.tar.gz"
+          if fetch_archive "$CLANG_URL" work/clang.tar.gz; then
+            tar -xzf work/clang.tar.gz -C work/toolchains/clang
+          else
+            echo "android.googlesource clang unavailable; using AOSP GitHub mirror"
+            git clone --depth=1 --filter=blob:none --sparse \
+              --branch android13-mainline-go-adbd-release \
+              https://github.com/msft-mirror-aosp/platform.prebuilts.clang.host.linux-x86.git \
+              work/clang-mirror
+            git -C work/clang-mirror sparse-checkout set clang-r450784d
+            cp -a work/clang-mirror/clang-r450784d/. work/toolchains/clang/
+          fi
+
+          GCC64_URL="https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/android-12.1.0_r27.tar.gz"
+          if fetch_archive "$GCC64_URL" work/gcc64.tar.gz; then
+            tar -xzf work/gcc64.tar.gz -C work/toolchains/gcc64
+          else
+            echo "android.googlesource gcc64 unavailable; using AOSP GitHub mirror"
+            git clone --depth=1 --branch android-12.1.0_r27 \
+              https://github.com/msft-mirror-aosp/platform.prebuilts.gcc.linux-x86.aarch64.aarch64-linux-android-4.9.git \
+              work/gcc64-mirror
+            tar -C work/gcc64-mirror --exclude=.git -cf - . | tar -C work/toolchains/gcc64 -xf -
+          fi
+
+          GCC32_URL="https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9/+archive/refs/tags/android-12.1.0_r27.tar.gz"
+          if fetch_archive "$GCC32_URL" work/gcc32.tar.gz; then
+            tar -xzf work/gcc32.tar.gz -C work/toolchains/gcc32
+          else
+            echo "android.googlesource gcc32 unavailable; using AOSP GitHub mirror"
+            git clone --depth=1 --branch android-12.1.0_r27 \
+              https://github.com/msft-mirror-aosp/platform.prebuilts.gcc.linux-x86.arm.arm-linux-androideabi-4.9.git \
+              work/gcc32-mirror
+            tar -C work/gcc32-mirror --exclude=.git -cf - . | tar -C work/toolchains/gcc32 -xf -
+          fi
+
+          work/toolchains/clang/bin/clang --version | head -1
+          work/toolchains/gcc64/bin/aarch64-linux-android-gcc --version | head -1
+          work/toolchains/gcc32/bin/arm-linux-androideabi-gcc --version | head -1
 
       - name: Reproducible build identity
         run: |
