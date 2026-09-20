@@ -1,0 +1,143 @@
+name: Build NetHunter Docker test kernel (NX563J)
+
+# Self-contained test build. This branch is not the official NetHunter device
+# branch; it exists only to validate Docker support on the Nubia Z17.
+
+on:
+  push:
+    branches: [nethunter-docker-test-20260920]
+    paths:
+      - ".github/workflows/build-docker.yml"
+      - "nethunter/**"
+      - "ipc/**"
+      - "arch/arm64/configs/**"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      DEFCONFIG: lineageos_nx563j_defconfig
+      CONFIG_FRAGMENT: nethunter/config/nethunter.fragment
+      DOCKER_FRAGMENT: nethunter/config/docker.fragment
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential ccache curl flex git libelf-dev \
+            libssl-dev python3 unzip wget xz-utils zip
+
+      - name: Prepare Android toolchains from stable mirrors
+        shell: bash
+        run: |
+          set -euo pipefail
+          NDK_VERSION=25.2.9519653
+          SDK_ROOT="${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}"
+          export ANDROID_SDK_ROOT="$SDK_ROOT"
+          export PATH="$SDK_ROOT/cmdline-tools/16.0/bin:$SDK_ROOT/cmdline-tools/latest/bin:$SDK_ROOT/platform-tools:$PATH"
+          NDK_ROOT="$SDK_ROOT/ndk/$NDK_VERSION"
+          if [[ ! -x "$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" ]]; then
+            yes | sdkmanager --licenses >/dev/null || true
+            sdkmanager "ndk;$NDK_VERSION"
+          fi
+          mkdir -p work/toolchains
+          ln -s "$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64" work/toolchains/clang
+
+          git clone --depth=1 --branch lineage-19.1 \
+            https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git \
+            work/toolchains/gcc64
+          git clone --depth=1 --branch lineage-19.1 \
+            https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git \
+            work/toolchains/gcc32
+
+          work/toolchains/clang/bin/clang --version | head -2
+          work/toolchains/gcc64/bin/aarch64-linux-android-gcc --version | head -1
+          work/toolchains/gcc32/bin/arm-linux-androideabi-gcc --version | head -1
+
+      - name: Reproducible build identity
+        run: |
+          source_epoch="$(git show -s --format=%ct HEAD)"
+          source_timestamp="$(LC_ALL=C date -u -d "@$source_epoch" '+%a %b %e %T UTC %Y')"
+          {
+            echo "SOURCE_DATE_EPOCH=$source_epoch"
+            echo "KBUILD_BUILD_TIMESTAMP=$source_timestamp"
+            echo "KBUILD_BUILD_USER=nx563j-nethunter-ci"
+            echo "KBUILD_BUILD_HOST=github-actions"
+            echo "KBUILD_BUILD_VERSION=1"
+          } >> "$GITHUB_ENV"
+          echo "Kernel source commit: $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Configure (defconfig + NetHunter + Docker fragments)
+        run: |
+          export PATH="$GITHUB_WORKSPACE/work/toolchains/clang/bin:$GITHUB_WORKSPACE/work/toolchains/gcc32/bin:$PATH"
+          make -j"$(nproc)" O=out ARCH=arm64 \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE="$GITHUB_WORKSPACE/work/toolchains/gcc64/bin/aarch64-linux-android-" \
+            CROSS_COMPILE_ARM32="$GITHUB_WORKSPACE/work/toolchains/gcc32/bin/arm-linux-androideabi-" \
+            CROSS_COMPILE_COMPAT="$GITHUB_WORKSPACE/work/toolchains/gcc32/bin/arm-linux-androideabi-" \
+            CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1 \
+            CLANG_TARGET_ARM32="--target=arm-linux-androideabi -B$GITHUB_WORKSPACE/work/toolchains/gcc32/bin" \
+            "$DEFCONFIG"
+          scripts/kconfig/merge_config.sh -m -O out "out/.config" "$CONFIG_FRAGMENT" "$DOCKER_FRAGMENT"
+          make -j"$(nproc)" O=out ARCH=arm64 \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE="$GITHUB_WORKSPACE/work/toolchains/gcc64/bin/aarch64-linux-android-" \
+            CROSS_COMPILE_ARM32="$GITHUB_WORKSPACE/work/toolchains/gcc32/bin/arm-linux-androideabi-" \
+            CROSS_COMPILE_COMPAT="$GITHUB_WORKSPACE/work/toolchains/gcc32/bin/arm-linux-androideabi-" \
+            CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1 \
+            CLANG_TARGET_ARM32="--target=arm-linux-androideabi -B$GITHUB_WORKSPACE/work/toolchains/gcc32/bin" \
+            olddefconfig
+
+          for opt in \
+            CONFIG_PID_NS CONFIG_IPC_NS CONFIG_USER_NS CONFIG_POSIX_MQUEUE \
+            CONFIG_DEVPTS_MULTIPLE_INSTANCES CONFIG_CGROUP_DEVICE \
+            CONFIG_CGROUP_PIDS CONFIG_MEMCG_KMEM CONFIG_VETH \
+            CONFIG_BRIDGE_NETFILTER CONFIG_MACVLAN CONFIG_IPVLAN \
+            CONFIG_VXLAN CONFIG_NETFILTER_XT_MATCH_ADDRTYPE; do
+            grep -qx "$opt=y" out/.config || { echo "::error::$opt did not resolve to y"; exit 1; }
+          done
+
+      - name: Build
+        shell: bash
+        run: |
+          set +e
+          export PATH="$GITHUB_WORKSPACE/work/toolchains/clang/bin:$PATH"
+          mkdir -p artifacts
+          make -j"$(nproc)" O=out ARCH=arm64 \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE="$GITHUB_WORKSPACE/work/toolchains/gcc64/bin/aarch64-linux-android-" \
+            CROSS_COMPILE_ARM32="$GITHUB_WORKSPACE/work/toolchains/gcc32/bin/arm-linux-androideabi-" \
+            CROSS_COMPILE_COMPAT="$GITHUB_WORKSPACE/work/toolchains/gcc32/bin/arm-linux-androideabi-" \
+            CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1 \
+            CLANG_TARGET_ARM32="--target=arm-linux-androideabi -B$GITHUB_WORKSPACE/work/toolchains/gcc32/bin" \
+            2>&1 | tee artifacts/build.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            echo "Kernel build failed with exit code $rc"
+            grep -E -i "error:|fatal:|undefined reference|cannot find|unrecognized|unsupported|ld:|make\\[[0-9]+\\].*\\*\\*\\*" artifacts/build.log | tail -n 30 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+            exit "$rc"
+          fi
+
+      - name: Collect artifacts
+        if: always()
+        run: |
+          mkdir -p artifacts
+          printf '%s\n' "$(git rev-parse HEAD)" > artifacts/KERNEL_SOURCE_COMMIT
+          cp out/arch/arm64/boot/Image.gz-dtb artifacts/ 2>/dev/null || true
+          cp out/.config artifacts/kernel.config 2>/dev/null || true
+          cp "$CONFIG_FRAGMENT" artifacts/applied.fragment
+          cp "$DOCKER_FRAGMENT" artifacts/docker.fragment
+          sha256sum artifacts/* 2>/dev/null | grep -v build.log | tee artifacts/SHA256SUMS || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nethunter-kernel-nx563j-docker
+          path: artifacts/
